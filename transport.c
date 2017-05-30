@@ -29,6 +29,25 @@ enum { CSTATE_ESTABLISHED, CSTATE_CLOSED, CSTATE_LISTEN, CSTATE_SYN_SENT,\
 
 typedef enum { NORMAL, SYN, SYNACK, ACK, FIN } packet_type;
 
+typedef struct save_packet save_packet;
+typedef struct save_packet
+{
+  int start;
+  int end;
+  char data[STCP_MSS];
+
+  save_packet *next;
+} save_packet;
+
+typedef struct preack_packet preack_packet;
+typedef struct preack_packet
+{
+  tcp_seq sequence_num;
+  int size;
+  
+  preack_packet *next;
+} preack_packet;
+
 /* this structure is global to a mysocket descriptor */
 typedef struct
 {
@@ -41,6 +60,8 @@ typedef struct
     int window;
     int iserror;
 
+    save_packet *save;
+    preack_packet *preack;
     /* any other connection-wide global variables go here */
 } context_t;
 
@@ -123,6 +144,12 @@ static void control_loop(mysocket_t sd, context_t *ctx)
     assert(ctx);
     tcp_seq seq_num, ack_num;
     packet_type type;
+    save_packet *save, *save_temp;
+    preack_packet *preack, *preack_temp;
+    /*int success; error checking */
+
+    
+
     int is_full = 0;
 
     while (!ctx->done)
@@ -156,6 +183,17 @@ static void control_loop(mysocket_t sd, context_t *ctx)
             }
 
             int data_size = stcp_app_recv (sd, data, packet_size);
+            preack = (preack_packet *) calloc (1, sizeof (preack_packet));
+            preack->sequence_num = ctx->present_sequence_num;
+            preack->size = data_size;
+            if (ctx->preack == NULL) ctx->preack = preack;
+            else 
+            {
+              preack_temp = ctx->preack;
+              while (preack_temp->next != NULL) preack_temp = preack_temp->next;
+              preack_temp->next = preack;
+            }
+
             send_packet (sd, ctx->present_sequence_num, \
                          ctx->present_ack_num, NORMAL, data, data_size);
             ctx->present_sequence_num += data_size;
@@ -203,7 +241,7 @@ static void control_loop(mysocket_t sd, context_t *ctx)
             if (type == ACK)
             {
               ctx->present_sequence_num = ack_num;
-              ctx->present_ack_num = seq_num + 1;
+              ctx->present_ack_num = seq_num;
               ctx->window = WINDOWS_SIZE;
               ctx->connection_state = CSTATE_ESTABLISHED;
               stcp_unblock_application (sd);
@@ -217,29 +255,293 @@ static void control_loop(mysocket_t sd, context_t *ctx)
             rcvd_packet (sd, &seq_num, &ack_num, &type, data, &size);
             if (type == NORMAL)
             {
-              send_packet (sd, ctx->present_sequence_num, \
-                           seq_num + size, ACK, NULL, 0);
-              ctx->present_ack_num = seq_num + size;
+              if (seq_num < ctx->present_ack_num)
+              {
+                our_dprintf ("BEFORE!\n");
+                send_packet (sd, ctx->present_sequence_num,\
+                             ctx->present_ack_num, ACK, NULL, 0);
+              }
+              else if (seq_num > ctx->present_ack_num)
+              {
+                our_dprintf ("AFTER!\n");
+                send_packet (sd, ctx->present_sequence_num,\
+                             ctx->present_ack_num, ACK, NULL, 0);
+                save = (save_packet *) calloc (1, sizeof (save_packet));
+                save->start = seq_num - ctx->present_ack_num;
+                if (save->start >= WINDOWS_SIZE)
+                {
+                  free (save);
+                  free (data);
+                  continue;
+                }
+                save->end = save->start + size;
+                if (save->end > WINDOWS_SIZE)
+                  save->end = WINDOWS_SIZE;
+                memcpy (save->data, data, save->end - save->start);
 
-              our_dprintf ("data transmission : %s\n", data);
-              stcp_app_send (sd, data, size);
+                if (ctx->save == NULL) ctx->save = save;
+                else
+                {
+                  save_temp = ctx->save;
+                  while (save_temp->next != NULL) save_temp = save_temp->next;
+                  save_temp->next = save;
+                }
+              }
+
+              else
+              {
+                our_dprintf ("PRINT!\n");
+                int size_temp = size;
+                save_temp = ctx->save;
+                while (save_temp != NULL)
+                {
+                  if (save_temp->start == size_temp)
+                  {
+                    size_temp += save_temp->end - save_temp->start;
+                    save_temp = save_temp->next;
+                  }
+                  else break;
+                }
+                send_packet (sd, ctx->present_sequence_num, \
+                             seq_num + size_temp, ACK, NULL, 0);
+                
+                void *data_merge = calloc (1, WINDOWS_SIZE);
+                memcpy (data_merge, data, size);
+                
+                save_temp = ctx->save;
+                while (save_temp != NULL)
+                {
+                  if (save_temp->start == size)
+                  {
+                    memcpy (data_merge + size, save_temp->data,\
+                            save_temp->end - save_temp->start);
+                    size += save_temp->end - save_temp->start;
+                    save = save_temp;
+                    save_temp = save_temp->next;
+                    ctx->save = save_temp;
+                    free (save);
+                  }
+                  else
+                  {
+                    while (save_temp != NULL)
+                    {
+                      save_temp->start -= size;
+                      save_temp->end -= size;
+                      save_temp = save_temp->next;
+                    }
+                  }
+                }
+
+                ctx->present_ack_num = seq_num + size;
+
+                our_dprintf ("data transmission : %s\n", data_merge);
+                stcp_app_send (sd, data_merge, size);
+                free (data_merge);
+              }
             }
 
             else if (type == ACK)
             {
-              ctx->window = WINDOWS_SIZE - (ctx->present_sequence_num - ack_num);
+              if (ack_num >= ctx->preack->sequence_num)
+              {
+                preack_temp = ctx->preack;
+                while (preack_temp != NULL)
+                {
+                  if (preack_temp->sequence_num < ack_num)
+                  {
+                    preack = preack_temp;
+                    preack_temp = preack_temp->next;
+                    ctx->preack = preack_temp;
+                    free (preack);
+                  }
+                  else break;
+                }
+              }
+
+              if (ctx->preack == NULL) ctx->window = WINDOWS_SIZE;
+              else
+              {
+                ctx->window = WINDOWS_SIZE -\
+                              (ctx->present_sequence_num -\
+                               ctx->preack->sequence_num);
+              }
               our_dprintf ("ctx->window = %d\n", ctx->window);
               assert (ctx->window <= WINDOWS_SIZE);
               our_dprintf ("ACK\n");
               is_full = 0;
-            } /* ack 처리 */
+
+              printf ("size : %d\n", size);
+              if (size != 0)
+              { 
+              our_dprintf ("Here?\n");
+                if (seq_num < ctx->present_ack_num)
+                  send_packet (sd, ctx->present_sequence_num,\
+                               ctx->present_ack_num, ACK, NULL, 0);
+                else if (seq_num > ctx->present_ack_num)
+                {
+                  send_packet (sd, ctx->present_sequence_num,\
+                               ctx->present_ack_num, ACK, NULL, 0);
+                  save = (save_packet *) calloc (1, sizeof (save_packet));
+                  save->start = seq_num - ctx->present_ack_num;
+                  if (save->start >= WINDOWS_SIZE)
+                  {
+                    free (save);
+                    free (data);
+                    continue;
+                  }
+                  save->end = save->start + size;
+                  if (save->end > WINDOWS_SIZE)
+                    save->end = WINDOWS_SIZE;
+                  memcpy (save->data, data, save->end - save->start);
+
+                  if (ctx->save == NULL) ctx->save = save;
+                  else
+                  {
+                    save_temp = ctx->save;
+                    while (save_temp->next != NULL) save_temp = save_temp->next;
+                    save_temp->next = save;
+                  }
+                }
+
+                else
+                {
+                  int size_temp = size;
+                  save_temp = ctx->save;
+                  while (save_temp != NULL)
+                  {
+                    if (save_temp->start == size_temp)
+                    {
+                      size_temp += save_temp->end - save_temp->start;
+                      save_temp = save_temp->next;
+                    }
+                    else break;
+                  }
+                  send_packet (sd, ctx->present_sequence_num, \
+                               seq_num + size_temp, ACK, NULL, 0);
+                
+                  void *data_merge = calloc (1, WINDOWS_SIZE);
+                  memcpy (data_merge, data, size);
+                
+                  save_temp = ctx->save;
+                  while (save_temp != NULL)
+                  {
+                    if (save_temp->start == size)
+                    {
+                      memcpy (data_merge + size, save_temp->data,\
+                              save_temp->end - save_temp->start);
+                      size += save_temp->end - save_temp->start;
+                      save = save_temp;
+                      save_temp = save_temp->next;
+                      ctx->save = save_temp;
+                      free (save);
+                    }
+                    else
+                    {
+                      while (save_temp != NULL)
+                      {
+                        save_temp->start -= size;
+                        save_temp->end -= size;
+                        save_temp = save_temp->next;
+                      }
+                    }
+                  }
+
+                  ctx->present_ack_num = seq_num + size;
+
+                  our_dprintf ("data transmission : %s\n", data_merge);
+                  stcp_app_send (sd, data_merge, size);
+                  free (data_merge);
+                } 
+              }
+            }
 
             else if (type == FIN)
             {
               send_packet (sd, ack_num, seq_num + 1, ACK, NULL, 0);
               ctx->present_ack_num = seq_num + 1;
               ctx->connection_state = CSTATE_CLOSE_WAIT;
-              if (size != 0) stcp_app_send (sd, data, size);
+              if (size != 0)
+              { 
+                if (seq_num < ctx->present_ack_num)
+                  send_packet (sd, ctx->present_sequence_num,\
+                               ctx->present_ack_num, ACK, NULL, 0);
+                else if (seq_num > ctx->present_ack_num)
+                {
+                  send_packet (sd, ctx->present_sequence_num,\
+                               ctx->present_ack_num, ACK, NULL, 0);
+                  save = (save_packet *) calloc (1, sizeof (save_packet));
+                  save->start = seq_num - ctx->present_ack_num;
+                  if (save->start >= WINDOWS_SIZE)
+                  {
+                    free (save);
+                    free (data);
+                    continue;
+                  }
+                  save->end = save->start + size;
+                  if (save->end > WINDOWS_SIZE)
+                    save->end = WINDOWS_SIZE;
+                  memcpy (save->data, data, save->end - save->start);
+
+                  if (ctx->save == NULL) ctx->save = save;
+                  else
+                  {
+                    save_temp = ctx->save;
+                    while (save_temp->next != NULL) save_temp = save_temp->next;
+                    save_temp->next = save;
+                  }
+                }
+
+                else
+                {
+                  int size_temp = size;
+                  save_temp = ctx->save;
+                  while (save_temp != NULL)
+                  {
+                    if (save_temp->start == size_temp)
+                    {
+                      size_temp += save_temp->end - save_temp->start;
+                      save_temp = save_temp->next;
+                    }
+                    else break;
+                  }
+                  send_packet (sd, ctx->present_sequence_num, \
+                               seq_num + size_temp, ACK, NULL, 0);
+                
+                  void *data_merge = calloc (1, WINDOWS_SIZE);
+                  memcpy (data_merge, data, size);
+                
+                  save_temp = ctx->save;
+                  while (save_temp != NULL)
+                  {
+                    if (save_temp->start == size)
+                    {
+                      memcpy (data_merge + size, save_temp->data,\
+                              save_temp->end - save_temp->start);
+                      size += save_temp->end - save_temp->start;
+                      save = save_temp;
+                      save_temp = save_temp->next;
+                      ctx->save = save_temp;
+                      free (save);
+                    }
+                    else
+                    {
+                      while (save_temp != NULL)
+                      {
+                        save_temp->start -= size;
+                        save_temp->end -= size;
+                        save_temp = save_temp->next;
+                      }
+                    }
+                  }
+
+                  ctx->present_ack_num = seq_num + size;
+
+                  our_dprintf ("data transmission : %s\n", data_merge);
+                  stcp_app_send (sd, data_merge, size);
+                  free (data_merge);
+                } 
+              }
+
               stcp_fin_received (sd);
             }
 
@@ -318,10 +620,10 @@ int send_packet (mysocket_t sd, tcp_seq seq_num, tcp_seq ack_num, \
   else if (type == ACK) packet->header.th_flags = TH_ACK;
   else if (type == FIN) packet->header.th_flags = TH_FIN;
   packet->header.th_win = htonl (WINDOWS_SIZE);
-  
+  packet->data_size = size;
+
   if (data != NULL) 
   {
-    packet->data_size = size;
     memcpy (packet->data, data, size);
     success = stcp_network_send (sd, packet, sizeof (STCPPacket), NULL);
   }
@@ -367,11 +669,11 @@ int rcvd_packet (mysocket_t sd, tcp_seq *seq_num, tcp_seq *ack_num, \
   else if (packet->header.th_flags == TH_FIN) *type = FIN;
   else *type = NORMAL;
 
+  if (data_size != NULL) *data_size = packet->data_size;
+
   if (packet->data_size != 0)
-  {
     memcpy (data, packet->data, STCP_MSS);
-    *data_size = packet->data_size;
-  }
+
   else data = NULL;
   
   free (packet);
